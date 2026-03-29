@@ -6,9 +6,9 @@ Pipeline: **Video/Webcam → YOLOv8 keypoints → MLP (59d) → State Machine �
 
 ```
 yoga-streamlit/
-├── app.py                   # Streamlit UI (Giai đoạn 4)
-├── inference_pipeline.py    # Core AI + State Machine (Giai đoạn 3)
-├── models/                  # Copy từ Kaggle vào đây
+├── app.py
+├── inference_pipeline.py
+├── models/
 │   ├── yoga_best_v2.pth
 │   ├── label_map.json
 │   ├── scaler.pkl
@@ -20,8 +20,6 @@ yoga-streamlit/
 
 ```bash
 pip install -r requirements.txt
-
-# Copy 4 file model từ Kaggle vào models/
 
 streamlit run app.py
 ```
@@ -57,17 +55,10 @@ Dùng **z-score** so với phân phối thực từ dataset:
 
 Skeleton vẽ **xanh lá** khi tư thế đúng, **đỏ** khi có lỗi.
 
-## Cài đặt nâng cao (sidebar)
+## Sidebar
 | Tham số | Mặc định | Ý nghĩa |
 |---|---|---|
 | Frames xác nhận | 15 | Bao nhiêu frame liên tiếp để ACTIVE |
 | Confidence tối thiểu | 70% | Ngưỡng để bắt đầu đếm |
 | Giữ pose (giây/rep) | 2.0 | Giữ bao lâu để +1 rep |
 | Xử lý mỗi N frames | 2 | Frame skip để tăng tốc |
-
-## Deploy lên Streamlit Cloud
-
-1. Push code lên GitHub (không commit `models/*.pth`)
-2. Vào share.streamlit.io → New app → chọn repo
-3. Upload model files qua Streamlit Secrets hoặc dùng script download từ Google Drive
-4. Done — có URL public để demo
