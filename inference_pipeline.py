@@ -1,7 +1,8 @@
 """
-inference_pipeline.py — Giai đoạn 3 theo đặc tả
-Ghép YOLOv8, MLP weights, pose_stats và State Machine thành một luồng duy nhất.
-app.py chỉ cần gọi pipeline.process_frame(frame) → PipelineResult
+inference_pipeline.py — Phiên bản Hoàn thiện (Production Ready)
+- Mạng MLP 62 chiều (Bổ sung 3 đặc trưng hình học không gian).
+- Chống rung nhiễu với DROP_FRAMES.
+- Tích hợp Gatekeeper: Ép về trạng thái IDLE khi nhận diện tư thế vô lý (OOD).
 """
 
 import json, pickle, time
@@ -20,11 +21,11 @@ from ultralytics import YOLO
 # MODEL
 # ──────────────────────────────────────────────────────────
 class YogaMLP(nn.Module):
-    def __init__(self, input_size=59, num_classes=5):
+    def __init__(self, input_size=62, num_classes=5):  # SỬA: 62 chiều
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_size, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.4),
-            nn.Linear(256, 128),        nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(input_size, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(256, 128),        nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.4),
             nn.Linear(128, 64),         nn.BatchNorm1d(64),  nn.ReLU(),
             nn.Linear(64, num_classes),
         )
@@ -32,7 +33,7 @@ class YogaMLP(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────
-# COCO CONFIG
+# COCO CONFIG & LOGIC MAX/MIN
 # ──────────────────────────────────────────────────────────
 SKELETON_EDGES = [
     (0,1),(0,2),(1,3),(2,4),
@@ -45,31 +46,29 @@ KP_GROUP = ['head','head','head','head','head',
             'left','right','left','right','left','right']
 KP_COLOR = {'head': (240,201,107), 'left': (100,220,80), 'right': (80,180,240)}
 
-JOINT_TRIPLES = [
-    (5, 7, 9,  'ang_L_elbow'),
-    (6, 8, 10, 'ang_R_elbow'),
-    (11,5, 7,  'ang_L_shoulder'),
-    (12,6, 8,  'ang_R_shoulder'),
-    (5, 11,13, 'ang_L_hip'),
-    (6, 12,14, 'ang_R_hip'),
-    (11,13,15, 'ang_L_knee'),
-    (12,14,16, 'ang_R_knee'),
+JOINT_PAIRS = [
+    (5, 7, 9, 6, 8, 10, 'ang_elbow'),
+    (11, 5, 7, 12, 6, 8, 'ang_shoulder'),
+    (5, 11, 13, 6, 12, 14, 'ang_hip'),
+    (11, 13, 15, 12, 14, 16, 'ang_knee')
 ]
+
 JOINT_DISPLAY = {
-    'ang_L_elbow':'Khuỷu trái', 'ang_R_elbow':'Khuỷu phải',
-    'ang_L_shoulder':'Vai trái', 'ang_R_shoulder':'Vai phải',
-    'ang_L_hip':'Hông trái',    'ang_R_hip':'Hông phải',
-    'ang_L_knee':'Gối trái',    'ang_R_knee':'Gối phải',
+    'ang_elbow_max': 'Tay duỗi',        'ang_elbow_min': 'Tay gập',
+    'ang_shoulder_max': 'Vai (góc mở)', 'ang_shoulder_min': 'Vai (góc khép)',
+    'ang_hip_max': 'Hông (trụ)',        'ang_hip_min': 'Hông (gập)',
+    'ang_knee_max': 'Chân (duỗi)',      'ang_knee_min': 'Chân (gập)',
 }
+
 JOINT_DIRECTION = {
-    'ang_L_elbow':    ('Duỗi thẳng khuỷu tay trái',    'Gập khuỷu tay trái lại'),
-    'ang_R_elbow':    ('Duỗi thẳng khuỷu tay phải',   'Gập khuỷu tay phải lại'),
-    'ang_L_shoulder': ('Nâng / mở rộng tay trái',      'Hạ tay trái xuống'),
-    'ang_R_shoulder': ('Nâng / mở rộng tay phải',      'Hạ tay phải xuống'),
-    'ang_L_hip':      ('Mở rộng hông trái',             'Đứng thẳng hơn ở hông trái'),
-    'ang_R_hip':      ('Mở rộng hông phải',             'Đứng thẳng hơn ở hông phải'),
-    'ang_L_knee':     ('Gập gối trái sâu hơn',          'Duỗi thẳng chân trái'),
-    'ang_R_knee':     ('Gập gối phải sâu hơn',          'Duỗi thẳng chân phải'),
+    'ang_elbow_max':    ('Duỗi thẳng cánh tay hơn',     'Giảm độ căng ở khuỷu tay'),
+    'ang_elbow_min':    ('Mở rộng góc tay gập ra',      'Gập tay sâu hơn nữa'),
+    'ang_shoulder_max': ('Nâng hoặc mở rộng vai hơn',   'Hạ bớt vai xuống'),
+    'ang_shoulder_min': ('Mở rộng góc vai ra',          'Khép vai lại gần thân hơn'),
+    'ang_hip_max':      ('Đẩy hông thẳng lên',          'Gập nhẹ hông lại'),
+    'ang_hip_min':      ('Mở rộng góc hông (ngẩng lên)','Gập người sâu hơn nữa'),
+    'ang_knee_max':     ('Duỗi thẳng gối (đứng thẳng)', 'Trùng nhẹ đầu gối xuống'),
+    'ang_knee_min':     ('Mở rộng góc gối',             'Gập gối sâu hơn (hạ trọng tâm)'),
 }
 
 Z_WARN  = 1.5
@@ -78,78 +77,72 @@ CONF_THRESH = 0.3
 
 
 # ──────────────────────────────────────────────────────────
-# STATE MACHINE
+# STATE MACHINE (CHỐNG RUNG NHIỄU)
 # ──────────────────────────────────────────────────────────
 class PoseState(Enum):
-    IDLE    = auto()   # chưa nhận diện được pose ổn định
-    PENDING = auto()   # đang đếm frame liên tiếp để xác nhận
-    ACTIVE  = auto()   # đã xác nhận, đang trong pose
-    HOLDING = auto()   # giữ pose (dùng cho rep counter)
+    IDLE    = auto()
+    PENDING = auto()
+    ACTIVE  = auto()
+    HOLDING = auto()
 
 @dataclass
 class StateMachine:
-    """
-    Debouncing: chỉ chuyển sang ACTIVE sau CONFIRM_FRAMES
-    liên tiếp cùng một pose với confidence đủ cao.
-    Rep counter: đếm số lần hoàn thành một chu kỳ pose.
-    """
-    CONFIRM_FRAMES: int  = 15    # frames liên tiếp để xác nhận
-    CONF_MIN:       float = 0.70  # confidence tối thiểu
-    HOLD_SECONDS:   float = 2.0   # giữ pose bao lâu để tính 1 rep
+    CONFIRM_FRAMES: int   = 10
+    CONF_MIN:       float = 0.70
+    HOLD_SECONDS:   float = 2.0
+    DROP_FRAMES:    int   = 5
 
     state:          PoseState = field(default=PoseState.IDLE)
     current_pose:   str       = field(default='')
     pending_pose:   str       = field(default='')
     pending_count:  int       = field(default=0)
+    drop_count:     int       = field(default=0)
     reps:           int       = field(default=0)
     hold_start:     float     = field(default=0.0)
+    target_pose:    str       = field(default='')
 
-    # Target pose do người dùng chọn ('' = bất kỳ)
-    target_pose: str = field(default='')
-
-    def update(self, pred_pose: str, confidence: float) -> 'StateMachine':
+    def update(self, pred_pose: str, confidence: float, valid_form: bool) -> 'StateMachine':
         now = time.time()
         active_pose = self.target_pose if self.target_pose else pred_pose
 
-        if confidence < self.CONF_MIN:
-            # Confidence thấp → quay về IDLE
-            self.state        = PoseState.IDLE
-            self.pending_count = 0
-            return self
-
-        if self.state == PoseState.IDLE:
-            if pred_pose == active_pose:
-                self.state        = PoseState.PENDING
-                self.pending_pose  = pred_pose
-                self.pending_count = 1
-            return self
-
-        if self.state == PoseState.PENDING:
-            if pred_pose == self.pending_pose:
-                self.pending_count += 1
-                if self.pending_count >= self.CONFIRM_FRAMES:
-                    self.state        = PoseState.ACTIVE
-                    self.current_pose  = pred_pose
-                    self.hold_start    = now
-            else:
-                # Pose thay đổi → reset
-                self.state         = PoseState.IDLE
-                self.pending_count  = 0
-            return self
+        is_good = (confidence >= self.CONF_MIN) and valid_form and (pred_pose == active_pose)
 
         if self.state in (PoseState.ACTIVE, PoseState.HOLDING):
-            if pred_pose == self.current_pose:
+            if is_good and (pred_pose == self.current_pose):
+                self.drop_count = 0
                 held = now - self.hold_start
                 if held >= self.HOLD_SECONDS and self.state == PoseState.ACTIVE:
                     self.state  = PoseState.HOLDING
                     self.reps  += 1
             else:
-                # Rời pose → quay về IDLE, chuẩn bị rep mới
-                self.state         = PoseState.IDLE
-                self.pending_count  = 0
-                self.hold_start     = 0.0
+                self.drop_count += 1
+                if self.drop_count >= self.DROP_FRAMES:
+                    self.state         = PoseState.IDLE
+                    self.drop_count    = 0
+                    self.pending_count = 0
+                    self.hold_start    = 0.0
             return self
 
+        if is_good:
+            if self.state == PoseState.IDLE:
+                self.state         = PoseState.PENDING
+                self.pending_pose  = pred_pose
+                self.pending_count = 1
+            elif self.state == PoseState.PENDING:
+                if pred_pose == self.pending_pose:
+                    self.pending_count += 1
+                    if self.pending_count >= self.CONFIRM_FRAMES:
+                        self.state        = PoseState.ACTIVE
+                        self.current_pose = pred_pose
+                        self.hold_start   = now
+                        self.drop_count   = 0
+                else:
+                    self.pending_pose  = pred_pose
+                    self.pending_count = 1
+        else:
+            self.state         = PoseState.IDLE
+            self.pending_count = 0
+            
         return self
 
     @property
@@ -162,54 +155,110 @@ class StateMachine:
 
 
 # ──────────────────────────────────────────────────────────
-# FEATURE EXTRACTION
+# FEATURE & VALIDATION
 # ──────────────────────────────────────────────────────────
 def _calc_angle(p1, p2, p3):
-    if np.any(p1 == 0) or np.any(p2 == 0) or np.any(p3 == 0):
-        return -1.0
+    if np.any(p1 == 0) or np.any(p2 == 0) or np.any(p3 == 0): return -1.0
     v1, v2 = p1 - p2, p3 - p2
     cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
     return float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0))))
 
+def _get_max_min_angles(a_left, a_right):
+    if a_left < 0 and a_right < 0: return -1.0, -1.0
+    if a_left < 0: return a_right, -1.0
+    if a_right < 0: return a_left, -1.0
+    return max(a_left, a_right), min(a_left, a_right)
+
 def _extract_features(keypoints):
     kp_xy, kp_conf = keypoints[:, :2], keypoints[:, 2]
-    hip_c   = (kp_xy[11] + kp_xy[12]) / 2
-    sho_c   = (kp_xy[5]  + kp_xy[6])  / 2
-    torso   = np.linalg.norm(sho_c - hip_c)
-    if torso < 1e-5:
-        return None, {}
+    hip_c = (kp_xy[11] + kp_xy[12]) / 2.0
+    sho_c = (kp_xy[5]  + kp_xy[6])  / 2.0
+    torso = np.linalg.norm(sho_c - hip_c)
+    if torso < 1e-5: return None, {}
+        
+    # --- 3 Tín hiệu Không gian ---
+    shoulder_width = np.linalg.norm(kp_xy[5] - kp_xy[6])
+    norm_shoulder_width = shoulder_width / (torso + 1e-8)
+    
+    dx = sho_c[0] - hip_c[0]
+    dy = sho_c[1] - hip_c[1]
+    spine_angle = np.degrees(np.arctan2(dy, dx))
+    norm_spine_angle = spine_angle / 180.0
+    
+    left_leg  = np.linalg.norm(kp_xy[11] - kp_xy[13]) + np.linalg.norm(kp_xy[13] - kp_xy[15])
+    right_leg = np.linalg.norm(kp_xy[12] - kp_xy[14]) + np.linalg.norm(kp_xy[14] - kp_xy[16])
+    avg_leg_length = (left_leg + right_leg) / 2.0
+    bone_ratio = torso / (avg_leg_length + 1e-8)
+    
+    spatial_features = np.array([norm_shoulder_width, norm_spine_angle, bone_ratio])
+    # -----------------------------
+
     norm_xy   = (kp_xy - hip_c) / torso
-    conf_feat = np.clip(kp_conf, 0, 1)
+    conf_feat = np.clip(kp_conf, 0.0, 1.0)
     angles_raw, angle_feat = {}, []
-    for i, j, k, name in JOINT_TRIPLES:
-        deg = _calc_angle(kp_xy[i], kp_xy[j], kp_xy[k])
-        angles_raw[name] = deg
-        angle_feat.append(deg / 180.0 if deg >= 0 else -1.0)
-    feat = np.concatenate([norm_xy.flatten(), conf_feat, np.array(angle_feat)])
+    
+    for i_L, j_L, k_L, i_R, j_R, k_R, name in JOINT_PAIRS:
+        deg_L = _calc_angle(kp_xy[i_L], kp_xy[j_L], kp_xy[k_L])
+        deg_R = _calc_angle(kp_xy[i_R], kp_xy[j_R], kp_xy[k_R])
+        a_max, a_min = _get_max_min_angles(deg_L, deg_R)
+        
+        angles_raw[f"{name}_max"] = a_max
+        angles_raw[f"{name}_min"] = a_min
+        angle_feat.append(a_max / 180.0 if a_max >= 0 else -1.0)
+        angle_feat.append(a_min / 180.0 if a_min >= 0 else -1.0)
+        
+    feat = np.concatenate([norm_xy.flatten(), conf_feat, np.array(angle_feat), spatial_features])
     return feat.astype(np.float32), angles_raw
+
+def _validate_form(pose, angles_raw, pose_stats):
+    stats = pose_stats.get(pose, {})
+    if not stats: return True
+    
+    alert_count = 0
+    for joint, deg in angles_raw.items():
+        if deg < 0: continue
+        s = stats.get(joint)
+        if not s or s['std'] < 1e-3: continue
+        
+        z = abs(deg - s['mean']) / s['std']
+        
+        if z > 3.5: 
+            return False
+        if z > 2.5: 
+            alert_count += 1
+            
+    if alert_count >= 3: 
+        return False
+        
+    return True
 
 
 # ──────────────────────────────────────────────────────────
-# FEEDBACK (z-score)
+# FEEDBACK & RENDERING
 # ──────────────────────────────────────────────────────────
 def _generate_feedback(pose, angles_raw, pose_stats, target_pose=''):
     feedback, effective = [], pose
     if target_pose and target_pose != pose:
         feedback.append(f"⚠️ Đang nhận '{pose}', chưa phải '{target_pose}'")
         effective = target_pose
+        
     stats = pose_stats.get(effective, {})
     issues = []
     for joint, deg in angles_raw.items():
         if deg < 0: continue
         s = stats.get(joint)
         if not s or s['std'] < 1e-3: continue
+        
         z = (deg - s['mean']) / s['std']
         if abs(z) < Z_WARN: continue
-        label    = JOINT_DISPLAY.get(joint, joint)
+        
+        label = JOINT_DISPLAY.get(joint, joint)
         dir_low, dir_high = JOINT_DIRECTION.get(joint, ('Điều chỉnh','Điều chỉnh'))
         direction = dir_low if z < 0 else dir_high
         icon = '🔴' if abs(z) >= Z_ALERT else '🟡'
+        
         issues.append((abs(z), f"{icon} {label}: {direction} ({deg:.0f}° / tb {s['mean']:.0f}°±{s['std']:.0f}°)"))
+        
     issues.sort(reverse=True)
     if not issues:
         feedback.append(f"✅ {effective} tốt! Mọi khớp trong phạm vi bình thường.")
@@ -217,24 +266,15 @@ def _generate_feedback(pose, angles_raw, pose_stats, target_pose=''):
         feedback.extend(m for _, m in issues)
     return feedback
 
-
-# ──────────────────────────────────────────────────────────
-# RENDERING
-# ──────────────────────────────────────────────────────────
 def _draw_skeleton(frame, kps, is_correct: bool):
     h, w = frame.shape[:2]
     edge_color = (80, 220, 80) if is_correct else (80, 80, 240)
-
     for a, b in SKELETON_EDGES:
         pa, pb = kps[a], kps[b]
         if pa[2] < CONF_THRESH or pb[2] < CONF_THRESH: continue
-        x1,y1 = int(pa[0]*w), int(pa[1]*h)  # nếu kp normalized
-        x2,y2 = int(pb[0]*w), int(pb[1]*h)
-        # kp là pixel gốc → không cần nhân
         x1,y1 = int(pa[0]), int(pa[1])
         x2,y2 = int(pb[0]), int(pb[1])
         cv2.line(frame, (x1,y1), (x2,y2), edge_color, 2, cv2.LINE_AA)
-
     for i, kp in enumerate(kps):
         if kp[2] < CONF_THRESH: continue
         x, y = int(kp[0]), int(kp[1])
@@ -242,13 +282,9 @@ def _draw_skeleton(frame, kps, is_correct: bool):
         cv2.circle(frame, (x, y), 5, col, -1, cv2.LINE_AA)
         cv2.circle(frame, (x, y), 8, col, 1,  cv2.LINE_AA)
 
-
-def _draw_hud(frame, pose, confidence, state_machine: StateMachine,
-              feedback: list[str]):
+def _draw_hud(frame, pose, confidence, state_machine: StateMachine, feedback: list[str]):
     h, w = frame.shape[:2]
     overlay = frame.copy()
-
-    # Top-left panel
     cv2.rectangle(overlay, (0,0), (300, 110), (15,15,20), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
@@ -257,22 +293,20 @@ def _draw_hud(frame, pose, confidence, state_machine: StateMachine,
     cv2.putText(frame, state_machine.status_text,     (12,78), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
     cv2.putText(frame, f'Reps: {state_machine.reps}', (12,100),cv2.FONT_HERSHEY_SIMPLEX, 0.55,(240,200,80),  1)
 
-    # Feedback lines (bottom)
     y0 = h - 10 - len(feedback) * 22
-    for i, line in enumerate(feedback[:4]):   # tối đa 4 dòng
-        clean = line.replace('🔴','[!]').replace('🟡','[~]').replace('✅','[ok]').replace('⚠️','[w]')
-        col = (80,80,240) if '[!]' in clean else \
+    for i, line in enumerate(feedback[:4]):
+        clean = line.replace('🔴','[!]').replace('🟡','[~]').replace('✅','[ok]').replace('⚠️','[w]').replace('❌','[X]')
+        col = (80,80,240) if ('[!]' in clean or '[X]' in clean) else \
               (80,200,240) if '[~]' in clean else (80,220,80)
         cv2.putText(frame, clean, (12, y0 + i*22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, col, 1, cv2.LINE_AA)
-
 
 # ──────────────────────────────────────────────────────────
 # RESULT DATACLASS
 # ──────────────────────────────────────────────────────────
 @dataclass
 class PipelineResult:
-    frame:        np.ndarray         # frame đã vẽ đè HUD + skeleton
+    frame:        np.ndarray
     pose:         str
     confidence:   float
     all_scores:   dict
@@ -283,7 +317,6 @@ class PipelineResult:
     status_text:  str
     person_found: bool
 
-
 # ──────────────────────────────────────────────────────────
 # MAIN PIPELINE CLASS
 # ──────────────────────────────────────────────────────────
@@ -291,27 +324,27 @@ class YogaPipeline:
     def __init__(self, model_dir: str = 'models'):
         d = Path(model_dir)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.yolo   = YOLO('yolov8n-pose.pt')
+        
+        # SỬA: Dùng YOLOv8s cho ổn định
+        self.yolo = YOLO('yolov8s-pose.pt')
 
         with open(d / 'label_map.json') as f:
             lm = json.load(f)
         self.class_names = [k for k,_ in sorted(lm.items(), key=lambda x: x[1])]
-
+        
         with open(d / 'scaler.pkl', 'rb') as f:
             self.scaler = pickle.load(f)
-
+            
         ps_path = d / 'pose_stats.json'
         self.pose_stats = json.loads(ps_path.read_text()) if ps_path.exists() else {}
 
-        self.mlp = YogaMLP(59, len(self.class_names)).to(self.device)
+        # SỬA: input_size=62
+        self.mlp = YogaMLP(62, len(self.class_names)).to(self.device)
         self.mlp.load_state_dict(torch.load(d / 'yoga_best_v2.pth', map_location=self.device))
         self.mlp.eval()
-
         self.sm = StateMachine()
-        print(f'✅ YogaPipeline ready | {self.class_names} | device={self.device}')
 
     def set_target(self, pose: str):
-        """Đặt pose mục tiêu cho State Machine."""
         self.sm.target_pose = pose
         self.sm.state        = PoseState.IDLE
         self.sm.pending_count = 0
@@ -325,70 +358,72 @@ class YogaPipeline:
     def supported_poses(self): return self.class_names
 
     def process_frame(self, frame: np.ndarray) -> PipelineResult:
-        """
-        Input : BGR frame (numpy)
-        Output: PipelineResult với frame đã được render
-        """
         out = frame.copy()
 
-        # 1. YOLOv8 → keypoints
+        # 1. YOLOv8
         results = self.yolo(frame, verbose=False)
         if not results or results[0].keypoints is None or len(results[0].keypoints) == 0:
             return PipelineResult(out,'',0,{},{},['Không phát hiện người trong frame.'],
                                   PoseState.IDLE, self.sm.reps, '⏸ Chờ...', False)
 
-        # Lấy person có bounding box lớn nhất
         boxes  = results[0].boxes
         kp_all = results[0].keypoints.data
-        if len(boxes) > 1:
-            areas = [(b[2]-b[0])*(b[3]-b[1]) for b in boxes.xyxy]
-            idx   = int(np.argmax(areas))
-        else:
-            idx = 0
-        raw_kpts = kp_all[idx].cpu().numpy()   # (17, 3)
+        idx = int(np.argmax([(b[2]-b[0])*(b[3]-b[1]) for b in boxes.xyxy])) if len(boxes) > 1 else 0
+        raw_kpts = kp_all[idx].cpu().numpy()
 
-        # 2. Feature extraction
+        # 2. Gatekeeper
+        kp_conf = raw_kpts[:, 2]
+        has_hip = kp_conf[11] > 0.4 or kp_conf[12] > 0.4
+        has_leg = (kp_conf[13] > 0.4 or kp_conf[14] > 0.4 or kp_conf[15] > 0.4 or kp_conf[16] > 0.4)
+        if not (has_hip and has_leg):
+            self.sm.state = PoseState.IDLE
+            self.sm.pending_count = 0
+            return PipelineResult(out, 'INCOMPLETE_BODY', 0.0, {}, {}, 
+                                  ['⚠️ Hãy lùi lại để camera thấy toàn thân'], 
+                                  PoseState.IDLE, self.sm.reps, '⚠️ Camera bị khuất', True)
+
+        # 3. Features
         feat, angles_raw = _extract_features(raw_kpts)
         if feat is None:
-            return PipelineResult(out,'',0,{},{},['Không đủ keypoint để phân tích.'],
-                                  PoseState.IDLE, self.sm.reps, '⏸ Chờ...', True)
+            return PipelineResult(out,'',0,{},{},['Không đủ keypoint.'], PoseState.IDLE, self.sm.reps, '⏸ Chờ...', True)
 
-        # 3. MLP inference
+        # 4. MLP inference
         feat_s = self.scaler.transform(feat.reshape(1,-1))
         t      = torch.tensor(feat_s, dtype=torch.float32).to(self.device)
         with torch.no_grad():
             probs = torch.softmax(self.mlp(t), dim=1).cpu().numpy()[0]
+        
         idx_pred   = int(np.argmax(probs))
         pred_pose  = self.class_names[idx_pred]
         confidence = float(probs[idx_pred])
         all_scores = {n: round(float(probs[i]),4) for i,n in enumerate(self.class_names)}
 
-        # 4. State Machine
-        self.sm.update(pred_pose, confidence)
+        # 5. Sanity Check (Bảo vệ vòng ngoài)
+        valid_form = _validate_form(pred_pose, angles_raw, self.pose_stats)
 
-        # 5. Feedback (chỉ khi ACTIVE/HOLDING)
-        if self.sm.state in (PoseState.ACTIVE, PoseState.HOLDING):
-            feedback = _generate_feedback(pred_pose, angles_raw, self.pose_stats,
-                                          self.sm.target_pose)
+        # 6 & 7. Ép về IDLE và Render
+        if not valid_form:
+            # 💡 ÉP VỀ IDLE NẾU DÁNG VÔ LÝ
+            pred_pose = "IDLE"
+            confidence = 0.0
+            self.sm.update("IDLE", 1.0, True)  # Reset State Machine
+            pred_pose_display = "IDLE (Đang chờ...)"
+            feedback = ["🧘 Hãy bước vào tư thế Yoga để hệ thống nhận diện!"]
+            is_correct = True  # Giữ khung xương màu xanh lá cho êm dịu
         else:
-            feedback = [self.sm.status_text]
+            self.sm.update(pred_pose, confidence, valid_form)
+            if self.sm.state in (PoseState.ACTIVE, PoseState.HOLDING):
+                pred_pose_display = pred_pose
+                feedback = _generate_feedback(pred_pose, angles_raw, self.pose_stats, self.sm.target_pose)
+            else:
+                pred_pose_display = pred_pose
+                feedback = [self.sm.status_text]
+            is_correct = (not any('🔴' in f or '🟡' in f or '❌' in f for f in feedback))
 
-        # 6. Render
-        is_correct = (not any('🔴' in f or '🟡' in f for f in feedback))
         _draw_skeleton(out, raw_kpts, is_correct)
-        _draw_hud(out, pred_pose, confidence, self.sm, feedback)
+        _draw_hud(out, pred_pose_display, confidence, self.sm, feedback)
 
         angles_display = {k: round(v,1) for k,v in angles_raw.items() if v >= 0}
 
-        return PipelineResult(
-            frame       = out,
-            pose        = pred_pose,
-            confidence  = confidence,
-            all_scores  = all_scores,
-            angles      = angles_display,
-            feedback    = feedback,
-            state       = self.sm.state,
-            reps        = self.sm.reps,
-            status_text = self.sm.status_text,
-            person_found= True,
-        )
+        return PipelineResult(out, pred_pose_display, confidence, all_scores, angles_display, 
+                              feedback, self.sm.state, self.sm.reps, self.sm.status_text, True)
