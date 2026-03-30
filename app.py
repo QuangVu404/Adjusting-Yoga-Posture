@@ -109,6 +109,8 @@ with st.sidebar:
         frame_skip = st.slider('Xử lý mỗi N frames', 1, 5, 2)
 
 
+frame_skip = 2   # default, bị override bởi slider trong expander
+
 # ──────────────────────────────────────────────────────────
 # MAIN AREA
 # ──────────────────────────────────────────────────────────
@@ -195,7 +197,7 @@ def process_and_display(frame, t0):
         cv2.putText(rgb, "⚠️ VUI LONG LUI LAI DE CAMERA THAY TOAN THAN", 
                     (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 80, 80), 2, cv2.LINE_AA)
 
-    video_ph.image(rgb, channels='RGB', use_column_width=True)
+    video_ph.image(rgb, channels='RGB', use_column_width='always')
     render_sidebar(result)
     render_info(result)
     ms = (time.perf_counter() - t0) * 1000

@@ -180,10 +180,12 @@ def _extract_features(keypoints):
     shoulder_width = np.linalg.norm(kp_xy[5] - kp_xy[6])
     norm_shoulder_width = shoulder_width / (torso + 1e-8)
     
+    # Góc cột sống so với trục Y (đứng thẳng)
+    # arctan2(dx, dy): 0° = thẳng đứng, 90° = nằm ngang
     dx = sho_c[0] - hip_c[0]
     dy = sho_c[1] - hip_c[1]
-    spine_angle = np.degrees(np.arctan2(dy, dx))
-    norm_spine_angle = spine_angle / 180.0
+    spine_angle_deg = abs(np.degrees(np.arctan2(abs(dx), abs(dy) + 1e-8)))
+    norm_spine_angle = spine_angle_deg / 90.0   # normalize về [0,1]: 0=thẳng, 1=ngang
     
     left_leg  = np.linalg.norm(kp_xy[11] - kp_xy[13]) + np.linalg.norm(kp_xy[13] - kp_xy[15])
     right_leg = np.linalg.norm(kp_xy[12] - kp_xy[14]) + np.linalg.norm(kp_xy[14] - kp_xy[16])
@@ -210,26 +212,58 @@ def _extract_features(keypoints):
     feat = np.concatenate([norm_xy.flatten(), conf_feat, np.array(angle_feat), spatial_features])
     return feat.astype(np.float32), angles_raw
 
-def _validate_form(pose, angles_raw, pose_stats):
+# spine_angle_deg theo pose: [min, max] độ hợp lệ
+# Đứng thẳng (warrior2, tree, goddess, chair): 0-25°
+# Nghiêng/khom (plank, downdog, cobra, bridge, child): 25-90°
+# Nghiêng bên (triangle): 15-60°
+_SPINE_BOUNDS = {
+    'downdog':  (25, 85),
+    'plank':    (30, 88),
+    'warrior2': ( 0, 22),
+    'tree':     ( 0, 18),
+    'goddess':  ( 0, 22),
+    'chair':    ( 0, 28),
+    'triangle': (15, 60),
+    'cobra':    (35, 88),
+    'bridge':   (30, 88),
+    'child':    (25, 85),
+}
+
+def _validate_form(pose, angles_raw, pose_stats, spine_angle_deg=None):
+    """
+    Kiểm tra tính hợp lệ hình học của pose được predict.
+    Kết hợp 2 tầng:
+      Tầng 1 (geometry): spine_angle phải nằm trong khoảng của pose đó
+      Tầng 2 (z-score) : không quá 2 góc khớp lệch hơn 3.0 std từ mean
+    Trả True = hợp lệ, False = bác bỏ
+    """
+    # Tầng 1: geometry guard
+    if spine_angle_deg is not None and pose in _SPINE_BOUNDS:
+        lo, hi = _SPINE_BOUNDS[pose]
+        if not (lo <= spine_angle_deg <= hi):
+            return False
+
+    # Tầng 2: z-score guard (chỉ dùng khi có pose_stats hợp lệ)
     stats = pose_stats.get(pose, {})
-    if not stats: return True
-    
+    if not stats:
+        return True
     alert_count = 0
     for joint, deg in angles_raw.items():
-        if deg < 0: continue
+        if deg < 0:
+            continue
         s = stats.get(joint)
-        if not s or s['std'] < 1e-3: continue
-        
+        if not s or s.get('std', 0) < 1e-3:
+            continue
+        # Chỉ dùng z-score nếu mean có vẻ hợp lệ (> 5° — không phải /180 cũ)
+        if s.get('mean', 0) < 5:  # bỏ qua nếu mean ~0 (angles bị /180 cũ)
+            continue
         z = abs(deg - s['mean']) / s['std']
-        
-        if z > 3.5: 
+        if z > 3.5:
             return False
-        if z > 2.5: 
+        if z > 2.5:
             alert_count += 1
-            
-    if alert_count >= 3: 
+    if alert_count >= 3:
         return False
-        
     return True
 
 
@@ -374,12 +408,13 @@ class YogaPipeline:
         # 2. Gatekeeper
         kp_conf = raw_kpts[:, 2]
         has_hip = kp_conf[11] > 0.4 or kp_conf[12] > 0.4
+        has_shoulder = kp_conf[5] > 0.4 or kp_conf[6] > 0.4
         has_leg = (kp_conf[13] > 0.4 or kp_conf[14] > 0.4 or kp_conf[15] > 0.4 or kp_conf[16] > 0.4)
-        if not (has_hip and has_leg):
+        if not (has_shoulder and has_hip and has_leg):
             self.sm.state = PoseState.IDLE
             self.sm.pending_count = 0
             return PipelineResult(out, 'INCOMPLETE_BODY', 0.0, {}, {}, 
-                                  ['⚠️ Hãy lùi lại để camera thấy toàn thân'], 
+                                  ['⚠️ Hãy lùi lại để camera thấy toàn thân (Vai - Hông - Chân)'], 
                                   PoseState.IDLE, self.sm.reps, '⚠️ Camera bị khuất', True)
 
         # 3. Features
@@ -399,17 +434,19 @@ class YogaPipeline:
         all_scores = {n: round(float(probs[i]),4) for i,n in enumerate(self.class_names)}
 
         # 5. Sanity Check (Bảo vệ vòng ngoài)
-        valid_form = _validate_form(pred_pose, angles_raw, self.pose_stats)
+        # feat layout: 34 xy + 17 conf + 8 angles + 3 spatial
+        # spatial[0]=norm_shoulder_width, spatial[1]=norm_spine_angle, spatial[2]=bone_ratio
+        spine_deg = float(feat[60]) * 90.0   # denormalize norm_spine_angle → degrees
+        valid_form = _validate_form(pred_pose, angles_raw, self.pose_stats, spine_angle_deg=spine_deg)
 
         # 6 & 7. Ép về IDLE và Render
         if not valid_form:
-            # 💡 ÉP VỀ IDLE NẾU DÁNG VÔ LÝ
-            pred_pose = "IDLE"
-            confidence = 0.0
-            self.sm.update("IDLE", 1.0, True)  # Reset State Machine
-            pred_pose_display = "IDLE (Đang chờ...)"
-            feedback = ["🧘 Hãy bước vào tư thế Yoga để hệ thống nhận diện!"]
-            is_correct = True  # Giữ khung xương màu xanh lá cho êm dịu
+            # Geometry guard từ chối — dùng DROP_FRAMES (không reset cứng)
+            # Cho phép vài frame thoáng qua trước khi về IDLE
+            self.sm.update(pred_pose, 0.0, False)   # confidence=0 → drop_count++
+            pred_pose_display = pred_pose
+            feedback = [f"🚫 Tư thế chưa đúng góc — {pred_pose} cần {'đứng thẳng hơn' if _SPINE_BOUNDS.get(pred_pose, (0,90))[0] < 10 else 'nghiêng thêm'}"]
+            is_correct = False
         else:
             self.sm.update(pred_pose, confidence, valid_form)
             if self.sm.state in (PoseState.ACTIVE, PoseState.HOLDING):
