@@ -180,12 +180,10 @@ def _extract_features(keypoints):
     shoulder_width = np.linalg.norm(kp_xy[5] - kp_xy[6])
     norm_shoulder_width = shoulder_width / (torso + 1e-8)
     
-    # Góc cột sống so với trục Y (đứng thẳng)
-    # arctan2(dx, dy): 0° = thẳng đứng, 90° = nằm ngang
     dx = sho_c[0] - hip_c[0]
     dy = sho_c[1] - hip_c[1]
-    spine_angle_deg = abs(np.degrees(np.arctan2(abs(dx), abs(dy) + 1e-8)))
-    norm_spine_angle = spine_angle_deg / 90.0   # normalize về [0,1]: 0=thẳng, 1=ngang
+    spine_angle = np.degrees(np.arctan2(dy, dx))
+    norm_spine_angle = spine_angle / 180.0
     
     left_leg  = np.linalg.norm(kp_xy[11] - kp_xy[13]) + np.linalg.norm(kp_xy[13] - kp_xy[15])
     right_leg = np.linalg.norm(kp_xy[12] - kp_xy[14]) + np.linalg.norm(kp_xy[14] - kp_xy[16])
@@ -212,58 +210,26 @@ def _extract_features(keypoints):
     feat = np.concatenate([norm_xy.flatten(), conf_feat, np.array(angle_feat), spatial_features])
     return feat.astype(np.float32), angles_raw
 
-# spine_angle_deg theo pose: [min, max] độ hợp lệ
-# Đứng thẳng (warrior2, tree, goddess, chair): 0-25°
-# Nghiêng/khom (plank, downdog, cobra, bridge, child): 25-90°
-# Nghiêng bên (triangle): 15-60°
-_SPINE_BOUNDS = {
-    'downdog':  (25, 85),
-    'plank':    (30, 88),
-    'warrior2': ( 0, 22),
-    'tree':     ( 0, 18),
-    'goddess':  ( 0, 22),
-    'chair':    ( 0, 28),
-    'triangle': (15, 60),
-    'cobra':    (35, 88),
-    'bridge':   (30, 88),
-    'child':    (25, 85),
-}
-
-def _validate_form(pose, angles_raw, pose_stats, spine_angle_deg=None):
-    """
-    Kiểm tra tính hợp lệ hình học của pose được predict.
-    Kết hợp 2 tầng:
-      Tầng 1 (geometry): spine_angle phải nằm trong khoảng của pose đó
-      Tầng 2 (z-score) : không quá 2 góc khớp lệch hơn 3.0 std từ mean
-    Trả True = hợp lệ, False = bác bỏ
-    """
-    # Tầng 1: geometry guard
-    if spine_angle_deg is not None and pose in _SPINE_BOUNDS:
-        lo, hi = _SPINE_BOUNDS[pose]
-        if not (lo <= spine_angle_deg <= hi):
-            return False
-
-    # Tầng 2: z-score guard (chỉ dùng khi có pose_stats hợp lệ)
+def _validate_form(pose, angles_raw, pose_stats):
     stats = pose_stats.get(pose, {})
-    if not stats:
-        return True
+    if not stats: return True
+    
     alert_count = 0
     for joint, deg in angles_raw.items():
-        if deg < 0:
-            continue
+        if deg < 0: continue
         s = stats.get(joint)
-        if not s or s.get('std', 0) < 1e-3:
-            continue
-        # Chỉ dùng z-score nếu mean có vẻ hợp lệ (> 5° — không phải /180 cũ)
-        if s.get('mean', 0) < 5:  # bỏ qua nếu mean ~0 (angles bị /180 cũ)
-            continue
+        if not s or s['std'] < 1e-3: continue
+        
         z = abs(deg - s['mean']) / s['std']
-        if z > 3.5:
+        
+        if z > 3.5: 
             return False
-        if z > 2.5:
+        if z > 2.5: 
             alert_count += 1
-    if alert_count >= 3:
+            
+    if alert_count >= 3: 
         return False
+        
     return True
 
 
@@ -354,6 +320,115 @@ class PipelineResult:
 # ──────────────────────────────────────────────────────────
 # MAIN PIPELINE CLASS
 # ──────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────
+# BỘ LỌC 1: KEYPOINT SMOOTHER (EMA Filter)
+# ──────────────────────────────────────────────────────────
+class KeypointSmoother:
+    """
+    Exponential Moving Average filter cho 17 keypoints COCO.
+    Làm mượt tọa độ (x, y) qua các frame liên tiếp.
+
+    Công thức EMA: smoothed = alpha * new + (1 - alpha) * prev
+      alpha gần 1 → bám sát frame mới (ít lag, ít mượt)
+      alpha gần 0 → mượt hơn nhưng lag nhiều
+
+    Chọn alpha = 0.4: đủ mượt cho demo, không lag nhìn thấy được.
+    Confidence KHÔNG filter (giữ nguyên để gatekeeper hoạt động đúng).
+    """
+    def __init__(self, alpha: float = 0.4, n_kp: int = 17):
+        self.alpha   = alpha
+        self.n_kp    = n_kp
+        self._prev   = None   # (17, 3) frame trước, None nếu chưa có
+
+    def reset(self):
+        self._prev = None
+
+    def smooth(self, kpts: np.ndarray) -> np.ndarray:
+        """
+        Input : (17, 3) — [x, y, conf] raw từ YOLOv8
+        Output: (17, 3) — [x_smooth, y_smooth, conf_raw]
+        """
+        if self._prev is None:
+            self._prev = kpts.copy()
+            return kpts.copy()
+
+        smoothed = kpts.copy()
+        # Chỉ EMA tọa độ (x, y), không chạm conf
+        smoothed[:, :2] = (
+            self.alpha * kpts[:, :2]
+            + (1.0 - self.alpha) * self._prev[:, :2]
+        )
+        self._prev = smoothed.copy()
+        return smoothed
+
+
+# ──────────────────────────────────────────────────────────
+# BỘ LỌC 2: FEEDBACK DEBOUNCER
+# ──────────────────────────────────────────────────────────
+class FeedbackDebouncer:
+    """
+    Ổn định lời khuyên feedback qua các frame.
+    Tránh câu cảnh báo chớp nháy khi người đang điều chỉnh chậm.
+
+    Quy tắc:
+      - Lỗi MỚI phải xuất hiện liên tục N_SHOW frames mới được hiển thị.
+      - Lỗi ĐÃ HIỆN phải biến mất liên tục N_HIDE frames mới bị gỡ.
+      - Lời khuyên ✅ (tốt) luôn hiển thị ngay, không cần debounce.
+
+    Cấu trúc nội tại:
+      _counts[msg] > 0  : frame liên tiếp msg xuất hiện (chờ show)
+      _counts[msg] < 0  : frame liên tiếp msg vắng mặt (chờ hide)
+      _active[msg]      : msg đang được hiển thị
+    """
+    def __init__(self, n_show: int = 5, n_hide: int = 5):
+        self.N_SHOW  = n_show   # frames liên tiếp để bật cảnh báo
+        self.N_HIDE  = n_hide   # frames liên tiếp để tắt cảnh báo
+        self._counts: dict[str, int] = {}
+        self._active: set[str]       = set()
+
+    def reset(self):
+        self._counts.clear()
+        self._active.clear()
+
+    def update(self, feedback_raw: list[str]) -> list[str]:
+        """
+        Input : list feedback thô từ _generate_feedback (frame hiện tại)
+        Output: list feedback đã debounce (ổn định)
+        """
+        # Tách riêng: lời khuyên tốt (✅) không cần debounce
+        good_msgs = [f for f in feedback_raw if f.startswith('✅')]
+        warn_msgs = [f for f in feedback_raw if not f.startswith('✅')]
+
+        current_set = set(warn_msgs)
+
+        # Cập nhật counter cho từng msg đang theo dõi
+        all_tracked = set(self._counts.keys()) | current_set
+        to_delete = []
+        for msg in all_tracked:
+            if msg in current_set:
+                # Msg đang xuất hiện → tăng counter dương
+                self._counts[msg] = max(self._counts.get(msg, 0), 0) + 1
+                if self._counts[msg] >= self.N_SHOW:
+                    self._active.add(msg)
+            else:
+                # Msg đã biến mất → giảm counter (đếm âm)
+                self._counts[msg] = min(self._counts.get(msg, 0), 0) - 1
+                if self._counts[msg] <= -self.N_HIDE:
+                    self._active.discard(msg)
+                    to_delete.append(msg)
+
+        # stable_warns = msgs đang trong _active (đã được confirm show)
+        # Quan trọng: lấy từ _active, KHÔNG lấy từ warn_msgs hiện tại
+        # vì khi warn vừa biến mất, warn_msgs=[] nhưng _active vẫn còn msg → cần giữ lại
+        stable_warns = list(self._active - {m for m in to_delete})
+
+        for msg in to_delete:
+            del self._counts[msg]
+
+        return stable_warns + good_msgs if stable_warns else good_msgs
+
+
 class YogaPipeline:
     def __init__(self, model_dir: str = 'models'):
         d = Path(model_dir)
@@ -376,16 +451,22 @@ class YogaPipeline:
         self.mlp = YogaMLP(62, len(self.class_names)).to(self.device)
         self.mlp.load_state_dict(torch.load(d / 'yoga_best_v2.pth', map_location=self.device))
         self.mlp.eval()
-        self.sm = StateMachine()
+        self.sm       = StateMachine()
+        self.smoother = KeypointSmoother(alpha=0.4)
+        self.debouncer = FeedbackDebouncer(n_show=5, n_hide=5)
 
     def set_target(self, pose: str):
-        self.sm.target_pose = pose
+        self.sm.target_pose  = pose
         self.sm.state        = PoseState.IDLE
         self.sm.pending_count = 0
+        self.smoother.reset()
+        self.debouncer.reset()
 
     def reset_reps(self):
         self.sm.reps       = 0
         self.sm.state      = PoseState.IDLE
+        self.smoother.reset()
+        self.debouncer.reset()
         self.sm.hold_start = 0.0
 
     @property
@@ -405,14 +486,24 @@ class YogaPipeline:
         idx = int(np.argmax([(b[2]-b[0])*(b[3]-b[1]) for b in boxes.xyxy])) if len(boxes) > 1 else 0
         raw_kpts = kp_all[idx].cpu().numpy()
 
-        # 2. Gatekeeper
+        # 1b. EMA Keypoint Smoother — làm mượt tọa độ trước mọi xử lý
+        raw_kpts = self.smoother.smooth(raw_kpts)
+
+        # 2. Gatekeeper (Người gác cổng nghiêm ngặt)
         kp_conf = raw_kpts[:, 2]
-        has_hip = kp_conf[11] > 0.4 or kp_conf[12] > 0.4
+        
+        # 💡 Bổ sung: Bắt buộc phải thấy ít nhất 1 bên Vai (để đảm bảo có thân trên)
         has_shoulder = kp_conf[5] > 0.4 or kp_conf[6] > 0.4
+        
+        has_hip = kp_conf[11] > 0.4 or kp_conf[12] > 0.4
         has_leg = (kp_conf[13] > 0.4 or kp_conf[14] > 0.4 or kp_conf[15] > 0.4 or kp_conf[16] > 0.4)
+        
+        # 💡 Điều kiện: Bắt buộc phải có đủ 3 bộ phận (Vai - Hông - Chân)
         if not (has_shoulder and has_hip and has_leg):
             self.sm.state = PoseState.IDLE
             self.sm.pending_count = 0
+            self.smoother.reset()   # Xóa dữ liệu cũ để tránh ảnh hưởng khi thấy lại người
+            self.debouncer.reset()
             return PipelineResult(out, 'INCOMPLETE_BODY', 0.0, {}, {}, 
                                   ['⚠️ Hãy lùi lại để camera thấy toàn thân (Vai - Hông - Chân)'], 
                                   PoseState.IDLE, self.sm.reps, '⚠️ Camera bị khuất', True)
@@ -434,27 +525,26 @@ class YogaPipeline:
         all_scores = {n: round(float(probs[i]),4) for i,n in enumerate(self.class_names)}
 
         # 5. Sanity Check (Bảo vệ vòng ngoài)
-        # feat layout: 34 xy + 17 conf + 8 angles + 3 spatial
-        # spatial[0]=norm_shoulder_width, spatial[1]=norm_spine_angle, spatial[2]=bone_ratio
-        spine_deg = float(feat[60]) * 90.0   # denormalize norm_spine_angle → degrees
-        valid_form = _validate_form(pred_pose, angles_raw, self.pose_stats, spine_angle_deg=spine_deg)
+        valid_form = _validate_form(pred_pose, angles_raw, self.pose_stats)
 
         # 6 & 7. Ép về IDLE và Render
         if not valid_form:
-            # Geometry guard từ chối — dùng DROP_FRAMES (không reset cứng)
-            # Cho phép vài frame thoáng qua trước khi về IDLE
-            self.sm.update(pred_pose, 0.0, False)   # confidence=0 → drop_count++
-            pred_pose_display = pred_pose
-            feedback = [f"🚫 Tư thế chưa đúng góc — {pred_pose} cần {'đứng thẳng hơn' if _SPINE_BOUNDS.get(pred_pose, (0,90))[0] < 10 else 'nghiêng thêm'}"]
-            is_correct = False
+            # 💡 ÉP VỀ IDLE NẾU DÁNG VÔ LÝ
+            pred_pose = "IDLE"
+            confidence = 0.0
+            self.sm.update("IDLE", 1.0, True)  # Reset State Machine
+            pred_pose_display = "IDLE (Đang chờ...)"
+            feedback = ["🧘 Hãy bước vào tư thế Yoga để hệ thống nhận diện!"]
+            is_correct = True  # Giữ khung xương màu xanh lá cho êm dịu
         else:
             self.sm.update(pred_pose, confidence, valid_form)
             if self.sm.state in (PoseState.ACTIVE, PoseState.HOLDING):
                 pred_pose_display = pred_pose
-                feedback = _generate_feedback(pred_pose, angles_raw, self.pose_stats, self.sm.target_pose)
+                feedback_raw = _generate_feedback(pred_pose, angles_raw, self.pose_stats, self.sm.target_pose)
+                feedback = self.debouncer.update(feedback_raw)
             else:
                 pred_pose_display = pred_pose
-                feedback = [self.sm.status_text]
+                feedback = self.debouncer.update([self.sm.status_text])
             is_correct = (not any('🔴' in f or '🟡' in f or '❌' in f for f in feedback))
 
         _draw_skeleton(out, raw_kpts, is_correct)
